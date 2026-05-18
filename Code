@@ -1,0 +1,170 @@
+// Envirotech Mid-Semester Project: Dual Sensor Logger with SD Card
+// 1) T/RH (SHT4x) 2) T/RH/CO2 (SCD30) - 3-Day Duration
+
+#include <Wire.h>                            // The "Translator" for I2C communication (Sensors)
+#include <SPI.h>                             // The "Translator" for SPI communication (SD Card)
+#include <SD.h>                              // Instructions for the MicroSD Card Breakout
+#include "Adafruit_SHT4x.h"                  // Instructions for Sensor 1 (SHT4x)
+#include <SensirionI2cScd30.h>               // Instructions for Sensor 2 (SCD30)
+
+// Create "Sensor Objects" so we can talk to our hardware in the loop
+Adafruit_SHT4x sht4x = Adafruit_SHT4x();
+SensirionI2cScd30 scd30;
+
+// Pin for the MicroSD Chip Select (CS). On SparkFun breakout, this is Pin 10.
+const int chipSelect = 10;
+
+// Math: 1000ms * 60s * 60m * 24h * 3 days = 259,200,000 milliseconds
+const unsigned long THREE_DAYS_MS = 259200000;
+
+// Troubleshooting optimization note: Set delay to 27 seconds to avoid buffer 
+// collision over I2C with SCD30 internal 2-second update sequence.
+const unsigned long SAMPLE_DELAY_MS = 27000; 
+
+void setup() {
+  // Start Serial communication at 9600 baud
+  Serial.begin(9600);
+ 
+  // Give the Serial Monitor 3 seconds to connect
+  delay(3000);
+  Serial.println(F("--- System Wake Up ---"));
+
+  // Initialize built-in LED as status indicator
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  // 1. INITIALIZE I2C BUS
+  Wire.begin();
+
+  // 2. INITIALIZE SHT40 SENSOR
+  if (!sht4x.begin()) {
+    Serial.println(F("Critical Error: Could not find SHT4x sensor!"));
+    while (1) { delay(10); } // Halt system if sensor missing
+  }
+  Serial.println(F("SHT4x Sensor Detected Successfully."));
+  
+  // Set precision configurations for SHT40
+  sht4x.setPrecision(SHT4X_HIGH_PRECISION);
+  sht4x.setHeater(SHT4X_NO_HEATER);
+
+  // 3. INITIALIZE SCD30 CO2 SENSOR
+  scd30.begin(Wire);
+  // Stop continuous measurement if it was running before to flush buffer
+  scd30.stopPeriodicMeasurement();
+  delay(500);
+  // Restart continuous measurement mode
+  scd30.startPeriodicMeasurement();
+  Serial.println(F("SCD30 NDIR Sensor Detected and Configured."));
+
+  // 4. INITIALIZE MICROSD CARD MODULE VIA SPI
+  Serial.print(F("Initializing SD card..."));
+  if (!SD.begin(chipSelect)) {
+    Serial.println(F("Initialization failed! Check CS pin and card format."));
+    while (1) { delay(10); } // Halt system if storage is offline
+  }
+  Serial.println(F("SD Card Ready."));
+
+  // 5. CREATE CSV FILE HEADER STRUCTURE
+  // If file doesn't exist, create it and print descriptive labels
+  if (!SD.exists("data.csv")) {
+    File dataFile = SD.open("data.csv", FILE_WRITE);
+    if (dataFile) {
+      dataFile.println(F("Millis,T1_SHT,RH1_SHT,T2_SCD,RH2_SCD,CO2_SCD"));
+      dataFile.close();
+      Serial.println(F("CSV Header file written successfully."));
+    }
+  }
+
+  // Turn indicator off once setup routine concludes cleanly
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.println(F("--- Setup Complete. Beginning Logging Array ---"));
+}
+
+void loop() {
+  // Grab absolute current run time
+  unsigned long currentMillis = millis();
+
+  // Guard Clause: Automatically stop logging if deployment window crosses 3 days
+  if (currentMillis >= THREE_DAYS_MS) {
+    Serial.println(F("=== 3-Day Window Complete. Logging Deactivated. ==="));
+    while (1) {
+      // Blink LED slow to notify user that data collection finished successfully
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(1000);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(1000);
+    }
+  }
+
+  // Visual feedback: blink built-in LED during read/write pulse
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  // 1. DATA CONTAINERS
+  sensors_event_t humidity1, temp1;
+  float temp2 = 0.0, hum2 = 0.0, co2 = 0.0;
+  bool sht_success = false;
+  bool scd_success = false;
+
+  // 2. EXECUTE SHT40 READOUT
+  sht_success = sht4x.getEvent(&humidity1, &temp1);
+
+  // 3. EXECUTE SCD30 READOUT (Check data ready flag)
+  uint16_t dataReady = 0;
+  scd30.getDataReadyStatus(dataReady);
+  
+  if (dataReady) {
+    uint16_t error = scd30.readMeasurement(co2, temp2, hum2);
+    if (error == 0) {
+      scd_success = true;
+    }
+  }
+
+  // 4. PRINT TELEMETRY DATA TO ARDUINO SERIAL MONITOR
+  Serial.print(currentMillis);
+  Serial.print(F(","));
+
+  if (sht_success) {
+    Serial.print(temp1.temperature); Serial.print(F(","));
+    Serial.print(humidity1.relative_humidity); Serial.print(F(","));
+  } else {
+    Serial.print(F("ERROR,ERROR,"));
+  }
+
+  if (scd_success) {
+    Serial.print(temp2); Serial.print(F(","));
+    Serial.print(hum2); Serial.print(F(","));
+    Serial.print(co2);
+  } else {
+    Serial.print(F("ERROR,ERROR,ERROR"));
+  }
+  Serial.println();
+
+  // 5. SECURELY LOG TELEMETRY INTERPOLATIONS TO DEPLOYED SD CARD
+  File dataFile = SD.open("data.csv", FILE_WRITE);
+  if (dataFile) {
+    dataFile.print(currentMillis);
+    dataFile.print(F(","));
+   
+    if (sht_success) {
+      dataFile.print(temp1.temperature); dataFile.print(F(","));
+      dataFile.print(humidity1.relative_humidity); dataFile.print(F(","));
+    } else {
+      dataFile.print(F("ERROR,ERROR,"));
+    }
+   
+    if (scd_success) {
+      dataFile.print(temp2); dataFile.print(F(","));
+      dataFile.print(hum2); dataFile.print(F(","));
+      dataFile.println(co2);
+    } else {
+      dataFile.println(F("ERROR,ERROR,ERROR"));
+    }
+    dataFile.close(); // Save and lock block sector to storage card
+  }
+
+  // 6. TOGGLE STATUS INDICATOR OFF
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // 7. TIME GAP COMPENSATED LOOP DELAY (27-Seconds Optimization)
+  delay(SAMPLE_DELAY_MS);
+}
